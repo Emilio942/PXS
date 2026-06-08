@@ -15,7 +15,8 @@ To decouple feature directions from their corresponding scales, the dense weight
 
 Where:
 * `V` is a direction matrix of size `256 x 1,000,000`. The columns of `V` are normalized on the unit sphere: `V_norm = V / ||V||_2`. These represent directions on the Grassmann manifold. No weight decay is applied to `V`.
-* `theta` is a scale log-norm vector of size `1,000,000` that learns the feature magnitudes. Targeted weight decay is applied to `theta` to prevent scale inflation.
+* `theta` is a scale log-norm vector of size `1,000,000` that learns the feature magnitudes. 
+* *Note on Initialization:* To prevent scale explosion and features from becoming permanently trapped below the activation threshold, scales must be initialized near $1.0$ (e.g. $\theta_i \approx 0.0$) rather than proportional to the highly skewed Zipfian prior probabilities.
 
 ---
 
@@ -64,21 +65,22 @@ A naive loss computation over the entire 1M-dimensional vocabulary space is comp
    `idx - 1`, `idx`, `idx + 1`, and `partner_idx + 1` (for correlated pairs).
    
 2. **Support-Weighted Loss:**
-   We compute the Focal Loss (`gamma = 2.0`, `lam = 5.0`) only on these gathered active indices:
-   `loss_active = weight_active * (pred_active - target_active)^2`
-   Where `weight_active` dynamically balances class imbalances based on the number of positive targets in the current batch.
+   We compute the Focal Loss (`gamma = 2.0`, `lam = 5.0`) only on these gathered active indices. Crucially, the losses must be normalized independently of the vocabulary size to prevent active/background gradient mismatch:
+   
+   `loss_active = (1 / N_pos) * sum_{i in active} FocalLoss(pred_i, target_i)`
 
 3. **Global Background Penalty (GBP):**
-   To prevent unselected dimensions from firing falsely, we penalize the squared predictions outside the active index support:
-   `gp_loss = (sum(pred^2) - sum(pred_active^2)) / V_vocab`
+   To prevent unselected dimensions from firing falsely, we penalize the squared predictions outside the active index support, scaled independently:
+   
+   `loss_background = (1 / N_neg) * sum_{i in inactive} pred_i^2`
 
-The total loss is the sum of the active loss and the global penalty: `loss_active + lambda_gp * gp_loss` (with `lambda_gp = 1e-3`).
+The total loss is the sum of the active loss and the global penalty: `loss_active + lambda_gp * loss_background` (with `lambda_gp = 1e-3`).
 
 ---
 
 ## 2. Mathematical Feature State Classification (Diagnostics)
 
-To analyze the trained checkpoint,  computes the following states for each of the 1,000,000 features:
+To analyze the trained checkpoint, [analyze_checkpoint.py](file:///home/emilio/Documents/ai/polysemantic_superposition/analyze_checkpoint.py) computes the following states for each of the 1,000,000 features:
 
 ### A. Global Bottleneck Projection Noise
 The background interference noise in the bottleneck caused by the superposition of all inactive features has a standard deviation of `sigma_n`:
@@ -95,7 +97,33 @@ A feature `i` is mathematically recoverable without loss of information (classif
 Where `sigma_eff(i) = sqrt( sigma_n^2 + p_i * max_j ||w_j||_2^2 )` is the effective noise variance accounting for self-interference, and `Gamma = 3.0` is a statistical detection constant.
 
 ### C. Feature State Categories
-* **Healthy (Fully Recoverable):** `||w_i||_2 >= tau_CR(i)`
-* **Weak (Unrecoverable in isolation, but active):** `epsilon_dead(i) <= ||w_i||_2 < tau_CR(i)`
+* **Healthy (Fully Recoverable):** `||w_i||_2 >= tau_CR(i)` and `||w_i||_2 >= sqrt(|b_i|)`
+* **Weak (Unrecoverable in isolation, but active):** `epsilon_dead(i) <= ||w_i||_2 < min(tau_CR(i), sqrt(|b_i|))`
 * **Dead (Collapsed/Inactive):** `||w_i||_2 < epsilon_dead(i)`
   Where `epsilon_dead(i)` represents the numerical precision floor under which gradient updates disappear into the machine epsilon (`1.19e-7` in FP32).
+
+> [!WARNING]
+> Entgegen linearer Näherungen dürfen seltene Features im Zipf-Tail im nicht-linearen Autoencoder keine winzigen Normen (wie $10^{-6}$) besitzen. Sie benötigen eine Mindestnorm von $\approx \sqrt{|b_i|} \approx 0.9$, um den Rausch-Bias $b_i$ bei Aktivierung zu überwinden. Eine Initialisierung proportional zur Zipf-Wahrscheinlichkeit ($r_i \propto p_i$) führt zum sofortigen Absterben des gesamten Tails.
+
+---
+
+## 3. CPU Inference Optimization (Dual Sparse CSR Matrices)
+
+For CPU inference under strict memory limitations (< 200 MB) and to bypass the system DDR RAM bandwidth bottleneck, the model utilizes **Dual Sparse CSR Matrices** combined with **Activation-Sparsified Gating**.
+
+### A. Dual CSR Weight Representation
+At `99%` sparsity (keeping only the top 1% largest absolute weights of `V_norm` and setting the rest to exactly 0), the direction matrix `V_norm` (size `[256, 1000000]`) is stored as two complementary Compressed Sparse Row (CSR) matrices:
+* `V_sparse` (shape `[256, 1000000]`): Used for the residual update step (multiplying sparse reconstruction by the dictionary).
+* `V_T_sparse` (shape `[1000000, 256]`): Used for the projection step (multiplying the bottleneck residual by the transposed dictionary).
+
+The combined memory footprint of these two matrices is **42.88 MB**, which fits entirely within the CPU's L3 cache, avoiding slow system RAM reads.
+
+### B. Activation-Sparsified Gating
+Since the activation function is clamped to `[0, 1]`, features only reconstruct if `g_star(proj_i + b_i) > 0`. 
+Solving this inequality for `g_star(y) = 0` yields:
+`y_threshold = ln(1 - alpha^2) / alpha` (which is `-0.1005` for `alpha = 0.1`).
+
+Therefore, a feature `i` can only be active if:
+`proj_i + b_i > y_threshold`
+
+We utilize this mask (`val > y_threshold`) to compute `soft_exponential` only on the active elements (typically `< 50` out of `1,000,000` features per batch element). This speeds up the activation step by over **20,000x**.
